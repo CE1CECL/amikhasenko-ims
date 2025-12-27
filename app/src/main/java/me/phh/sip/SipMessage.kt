@@ -95,10 +95,7 @@ open class SipCommonMessage(
     override val body: ByteArray = ByteArray(0),
     private val autofill: Boolean = true,
 ) : SipMessage() {
-    override val headers: SipHeadersMap
-    init {
-        headers = if (autofill) completeHeaders() else headersParam
-    }
+    override val headers: SipHeadersMap = if (autofill) completeHeaders() else headersParam
 
     override fun toString(): String =
         String(toByteArray(), Charsets.US_ASCII).replace("\r\n", "\n> ")
