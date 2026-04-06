@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: GPL-2.0
+
+cc_library_shared {
+    name: "librnnoise_jni",
+    srcs: [
+        "rnnoise_jni.c",
+        "rnnoise/src/denoise.c",
+        "rnnoise/src/kiss_fft.c",
+        "rnnoise/src/rnn.c",
+        "rnnoise/src/rnn_data.c",
+        "rnnoise/src/pitch.c",
+        "rnnoise/src/celt_lpc.c",
+    ],
+    local_include_dirs: ["rnnoise/include"],
+    header_libs: ["jni_headers"],
+    shared_libs: [
+        "liblog",
+        "libm",
+    ],
+    cflags: ["-Wno-unused-parameter"],
+}
