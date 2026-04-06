@@ -12,20 +12,8 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <application
-        android:allowBackup="true"
-        android:icon="@mipmap/ic_launcher"
-        android:label="@string/app_name"
-        android:roundIcon="@mipmap/ic_launcher_round"
-        android:supportsRtl="true"
-        android:theme="@style/Theme.Ims">
-        <activity
-            android:name=".MainActivity"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
+        android:allowBackup="false"
+        android:label="@string/app_name">
         <service
             android:name="me.phh.ims.PhhImsService"
             android:exported="true"
@@ -34,7 +22,7 @@
             android:permission="android.permission.BIND_IMS_SERVICE">
             <!-- directBootAware probably not needed see
             https://developer.android.com/training/articles/direct-boot.html -->
-            <!-- persistent: requires app to be built as a system app: how? -->
+            <!-- persistent: requires app to be built as a system app -->
             <!-- permission also requires app to be built as system app:
                  so any ImsService implementations defined here are required to be System
                  applications and must reside in the /system/priv-app/ or /product/priv-app/
@@ -45,9 +33,6 @@
             <action android:name="android.telephony.ims.ImsService" />
         </intent-filter>
       </service>
-      <!--<receiver android:name=".AlarmBroadcastReceiver"
-      android:exported="false" />-->
-      <!--android:enabled="true"-->
     </application>
     <protected-broadcast android:name="me.phh.ims.ALARM_PERIODIC_REGISTER" />
 
