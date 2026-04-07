@@ -220,7 +220,7 @@ class SipHandler(val ctxt: Context) {
             pcscfs[0] as InetAddress
         } else {
             // RIL didn't provide P-CSCF via LinkProperties. Try standard 3GPP DNS discovery
-            // (TS 24.229 §5.1.2A): resolve the well-known IMS domain for this PLMN.
+            // (TS 23.003 §13.2): resolve the well-known IMS domain for this PLMN.
             val dnsFallback =
                 try { InetAddress.getByName("ims.mnc${mnc}.mcc${mcc}.pub.3gppnetwork.org") } catch(t: Throwable) { null }
                 ?: try { InetAddress.getByName("ims.mnc${mnc}.mcc${mcc}.3gppnetwork.org") } catch(t: Throwable) { null }
