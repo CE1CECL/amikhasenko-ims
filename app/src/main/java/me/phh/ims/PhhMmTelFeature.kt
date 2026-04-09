@@ -38,6 +38,7 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
 
     val imsSms = PhhImsSms(slotId)
     lateinit var sipHandler: SipHandler
+    fun getSipHandlerOrNull(): SipHandler? = if (this::sipHandler.isInitialized) sipHandler else null
 
     override fun initialize(context: Context?, slotId: Int) {
         super.initialize(context, slotId)

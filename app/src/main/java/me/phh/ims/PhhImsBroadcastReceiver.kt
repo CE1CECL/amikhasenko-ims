@@ -25,7 +25,7 @@ class PhhImsBroadcastReceiver : BroadcastReceiver() {
             // XXX take some lock until this comes back?
             // (not function return, but callback after notify)
             CoroutineScope(Dispatchers.IO).launch {
-                imsService.mmTelFeature?.sipHandler?.register()
+                imsService.mmTelFeature?.getSipHandlerOrNull()?.register()
             }
             return
         }
