@@ -52,6 +52,9 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
             Executors.newSingleThreadExecutor(),
             object : TelephonyCallback(), TelephonyCallback.ServiceStateListener {
                 override fun onServiceStateChanged(serviceState: ServiceState) {
+                    // STATE_IN_SERVICE requires SIM unlocked and fully registered.
+                    // During PIN-lock phase state is STATE_EMERGENCY_ONLY — skip it.
+                    if (serviceState.state != ServiceState.STATE_IN_SERVICE) return
                     serviceState.networkRegistrationInfoList.forEach {
                         // A valid RPLMN is needed for SipHandler
                         if (!(it.registeredPlmn?.isEmpty() ?: true)) {
