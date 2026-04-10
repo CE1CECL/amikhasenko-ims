@@ -47,6 +47,9 @@ framework APIs (`Rlog`, `MmTelFeature`, `ImsConfigImplBase`, etc.) without patch
 The following shows the full diff needed in your device tree. Adapt paths and package
 names for your device.
 
+If you have the same device, you can apply [the patch](./device_a21s_common.patch)
+to [`device_a21s_common`](https://github.com/LineageOS/android_device_samsung_a21s-common) repository
+
 ### `common.mk` (or `device.mk`)
 
 ```makefile
