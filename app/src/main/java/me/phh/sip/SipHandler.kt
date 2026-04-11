@@ -24,6 +24,7 @@ import java.io.*
 import java.net.*
 import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.thread
 import kotlin.concurrent.withLock
@@ -129,6 +130,8 @@ class SipHandler(val ctxt: Context) {
     var onSmsReceived: ((Int, String, ByteArray) -> Unit)? = null
     var onSmsStatusReportReceived: ((Int, String, ByteArray) -> Unit)? = null
     var onIncomingCall: ((handle: Object, from: String, extras: Map<String, String>) -> Unit)? =
+        null
+    var onOutgoingCallConnected: ((handle: Object, extras: Map<String, String>) -> Unit)? =
         null
     var onCancelledCall: ((handle: Object, from: String, extras: Map<String, String>) -> Unit)? =
         null
@@ -402,16 +405,17 @@ class SipHandler(val ctxt: Context) {
         // start both in threads as we're only called here from network
         // callback from which it's better to return
         CoroutineScope(Dispatchers.IO).launch {
-            // XXX catch and reconnect on 'java.net.SocketException: Software caused connection
-            // abort' ?
             try {
-                while (true) {
-                    parseMessage(socket.gReader(), socket.gWriter())
-                }
+                while (parseMessage(socket.gReader(), socket.gWriter())) { }
+                Rlog.w(TAG, "Main socket got EOF, reconnecting")
             } catch(t: Throwable) {
-                Rlog.d(TAG, "Got exception in main/control socket", t)
+                Rlog.w(TAG, "Got exception in main/control socket, reconnecting", t)
             }
             socket.close()
+            try { connect() } catch (t: Throwable) {
+                Rlog.e(TAG, "Reconnect after main socket loss failed", t)
+                imsFailureCallback?.invoke()
+            }
         }
         CoroutineScope(Dispatchers.IO).launch {
             try {
@@ -820,6 +824,7 @@ a=sendrecv
     @SuppressLint("MissingPermission")
     fun callEncodeThread() {
         val call = currentCall!!
+        val gen = callGeneration.get()
         thread {
             var sequenceNumber = 0
 
@@ -830,6 +835,11 @@ a=sendrecv
             encoder.start()
 
             while(!callStarted.get()) {
+                if (callStopped.get() || callGeneration.get() != gen) {
+                    encoder.stop()
+                    encoder.release()
+                    return@thread
+                }
                 val timestamp = sequenceNumber * 160
                 Thread.sleep(20)
                 val rtpHeader = listOf(
@@ -865,7 +875,7 @@ a=sendrecv
             val buffer = ByteArray(bufferSize)
             val bufferPostRnnoise = ByteArray(bufferSize)
             while (true) {
-                if (callStopped.get()) break
+                if (callStopped.get() || callGeneration.get() != gen) break
                 val nRead = audioRecord.read(buffer,0, buffer.size)
                 // Convert buffer from ByteArray to ShortArray
                 rnnNoise.processFrame(buffer, bufferPostRnnoise)
@@ -878,9 +888,19 @@ a=sendrecv
                 // Fake timestamp but it is not appearing in the output stream anyway
                 encoder.queueInputBuffer(inBufIdx, 0, nRead, System.nanoTime() / 1000, 0)
 
+                // Drain all output frames the encoder produced for this input.
+                // Use -1 (block) on the first call so we always wait for the async
+                // C2 encoder to finish; use 0 on subsequent calls to collect any
+                // additional frames without stalling.  Without draining, the output
+                // queue fills up and dequeueInputBuffer(-1) deadlocks.
                 val outBufInfo = MediaCodec.BufferInfo()
-                val outBufIdx = encoder.dequeueOutputBuffer(outBufInfo, 0)
-                if (outBufIdx >= 0) {
+                var drainTimeout = -1L
+                while (true) {
+                    val outBufIdx = encoder.dequeueOutputBuffer(outBufInfo, drainTimeout)
+                    drainTimeout = 0L
+                    if (outBufIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) continue
+                    if (outBufIdx < 0) break
+
                     val outBuf = encoder.getOutputBuffer(outBufIdx)!!
 
                     val encoderData = ByteArray(outBufInfo.size)
@@ -983,11 +1003,16 @@ a=sendrecv
         val callId = resp.headers["call-id"]!![0]
         val rseq = resp.headers["rseq"]!![0]
         val whatToPrack = "$rseq ${resp.headers["cseq"]!![0]}"
+        // PRACK is a request within the early dialog; route set comes from Record-Route
+        // in the provisional response (RFC 3262 §4, RFC 3261 §12.1.2), not from the
+        // registration Service-Route stored in commonHeaders.
+        val dialogRoute = resp.headers["record-route"]
+        val headers = if (dialogRoute != null) commonHeaders + ("route" to dialogRoute) else commonHeaders
         val msg =
             SipRequest(
                 SipMethod.PRACK,
                 who,
-                headersParam = commonHeaders + """
+                headersParam = headers + """
                     RAck: $whatToPrack
                     Require: sec-agree
                     To: ${resp.headers["to"]!![0]}
@@ -1022,13 +1047,13 @@ a=sendrecv
     fun terminateCall() {
         callStopped.set(true)
         val call = currentCall ?: return
+        // BYE is a dialog request; must use dialog route set (from 200 OK Record-Route)
+        // stored in call.callHeaders, not the registration Service-Route in commonHeaders
+        val byeHeaders = call.callHeaders.filterKeys { it != "content-type" }
         val bye = SipRequest(
             SipMethod.BYE,
             call.remoteContact,
-            headersParam = commonHeaders +
-                ("from"    to call.callHeaders["from"]!!) +
-                ("to"      to call.callHeaders["to"]!!) +
-                ("call-id" to call.callHeaders["call-id"]!!)
+            headersParam = byeHeaders
         )
         Rlog.d(TAG, "Sending BYE $bye")
         synchronized(socket.gWriter()) { socket.gWriter().write(bye.toByteArray()) }
@@ -1062,6 +1087,10 @@ a=sendrecv
     var respInFlight: SipResponse? = null
     fun call(phoneNumber: String) {
         thread {
+            callStopped.set(false)
+            callStarted.set(false)
+            threadsStarted.set(false)
+            callGeneration.incrementAndGet()
 
             val rtpSocket = DatagramSocket(0, localAddr)
             network.bindSocket(rtpSocket)
@@ -1163,19 +1192,36 @@ a=sendrecv
                     val cseq = cseqLine.split(" ")[0].toInt()
                     val newTo = resp.headers["to"]!![0]
                     val newFrom = resp.headers["from"]!![0]
+                    // ACK to 2xx must be sent to the Contact from the response (RFC 3261 §13.2.2.4)
+                    val ackTo = resp.headers["contact"]?.get(0)
+                        ?.let { extractDestinationFromContact(it) } ?: to
+                    // ACK is a dialog request; route set comes from Record-Route in the 200 OK
+                    // (RFC 3261 §12.1.2), not from the registration Service-Route in myHeaders.
+                    val dialogRoute = resp.headers["record-route"]
+                    val ackHeaders = if (dialogRoute != null) myHeaders + ("route" to dialogRoute) else myHeaders
                     val msg2 =
                         SipRequest(
                             SipMethod.ACK,
-                            to,
-                            myHeaders - "content-type" + """
+                            ackTo,
+                            ackHeaders - "content-type" + """
                                 CSeq: $cseq ACK
                                 To: $newTo
                                 From: $newFrom
                                 """.toSipHeadersMap()
                         )
+                    Rlog.d(TAG, "Sending $msg2")
                     synchronized(socket.gWriter()) { socket.gWriter().write(msg2.toByteArray()) }
                     callStarted.set(true)
+                    // Update dialog route set from the confirmed 200 OK (RFC 3261 §12.1.2)
+                    // so that subsequent in-dialog requests (BYE, UPDATE) use the correct route.
+                    val rrFrom200Ok = resp.headers["record-route"]
+                    if (rrFrom200Ok != null) {
+                        currentCall = currentCall?.copy(
+                            callHeaders = currentCall!!.callHeaders + ("route" to rrFrom200Ok)
+                        )
+                    }
                     Rlog.d(TAG, "Invite got SUCCESS")
+                    onOutgoingCallConnected?.invoke(Object(), emptyMap())
                 } else {
                     Rlog.d(TAG, "Invite got status ${resp.statusCode} = ${resp.statusString}")
                     if(resp.statusCode >= 400) {
@@ -1243,8 +1289,10 @@ a=sendrecv
 
                     if (localNone) {
                         // "Allocating our local resource" and update the call
-                        callDecodeThread()
-                        callEncodeThread()
+                        if (threadsStarted.compareAndSet(false, true)) {
+                            callDecodeThread()
+                            callEncodeThread()
+                        }
 
                         val newSdp = respSdp.map { line ->
                             if (line.startsWith("a=curr:qos local")) {
@@ -1271,8 +1319,10 @@ a=sendrecv
                 }
 
                 if(!isPrecondition && resp.statusCode == 183) {
-                    callDecodeThread()
-                    callEncodeThread()
+                    if (threadsStarted.compareAndSet(false, true)) {
+                        callDecodeThread()
+                        callEncodeThread()
+                    }
                 }
 
                 false // Return true when we want to stop receiving messages for that call
@@ -1283,6 +1333,7 @@ a=sendrecv
     }
 
     fun callDecodeThread() {
+        val gen = callGeneration.get()
         // Receiving thread
         thread {
             val minBufferSize = AudioTrack.getMinBufferSize(8000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
@@ -1295,7 +1346,7 @@ a=sendrecv
             decoder.start()
 
             while(true) {
-                if(callStopped.get()) break
+                if (callStopped.get() || callGeneration.get() != gen) break
                 val dgramBuf = ByteArray(2048)
                 val dgram = DatagramPacket(dgramBuf, dgramBuf.size)
                 currentCall!!.rtpSocket.receive(dgram)
@@ -1361,6 +1412,8 @@ a=sendrecv
     val callStopped = AtomicBoolean(false)
     val callStarted = AtomicBoolean(false)
     val updateReceived = AtomicBoolean(false)
+    val threadsStarted = AtomicBoolean(false)
+    val callGeneration = AtomicInteger(0)
 
     val prAckWaitLock = Object()
     var prAckWait = mutableSetOf<Int>()
@@ -1369,6 +1422,8 @@ a=sendrecv
         if (contentType != "application/sdp") return 404
         callStopped.set(false)
         callStarted.set(false)
+        threadsStarted.set(false)
+        callGeneration.incrementAndGet()
 
         val f = request.headers["from"]
         val r = Regex(".*(sip|tel):([^@]*).*")
@@ -1523,9 +1578,10 @@ a=sendrecv
                 remoteContact = extractDestinationFromContact(request.headers["contact"]!![0]),
             )
 
-            callDecodeThread()
-            callEncodeThread()
-
+            if (threadsStarted.compareAndSet(false, true)) {
+                callDecodeThread()
+                callEncodeThread()
+            }
 
             synchronized(prAckWaitLock) {
                 prAckWait += mySeqCounter

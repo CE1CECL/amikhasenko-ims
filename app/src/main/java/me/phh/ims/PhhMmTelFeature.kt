@@ -20,6 +20,7 @@ import android.telephony.ims.stub.ImsRegistrationImplBase.REGISTRATION_TECH_LTE
 import android.telephony.ims.stub.ImsSmsImplBase
 import android.telephony.ims.stub.ImsUtImplBase
 import java.util.concurrent.Executors
+import java.lang.Object
 import me.phh.sip.SipHandler
 import me.phh.sip.randomBytes
 import me.phh.sip.toHex
@@ -78,6 +79,7 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
         return object: ImsCallSessionImplBase() {
             private val mCallId = randomBytes(12).toHex()
             lateinit var mListener: ImsCallSessionListener
+            var mState = State.INITIATED
             override fun getCallId(): String {
                 return mCallId
             }
@@ -100,7 +102,7 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
             }
 
             override fun getState(): Int {
-                return State.ESTABLISHED
+                return mState
             }
 
             override fun setListener(listener: ImsCallSessionListener) {
@@ -114,7 +116,25 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
 
             override fun terminate(reason: Int) {
                 Rlog.d(TAG, "Terminating call with reason $reason")
-                mListener.callSessionTerminated(ImsReasonInfo(ImsReasonInfo.CODE_USER_TERMINATED, 0, "Kikoo"))
+                sipHandler.myHandler.post {
+                    sipHandler.terminateCall()
+                    mListener.callSessionTerminated(ImsReasonInfo(ImsReasonInfo.CODE_USER_TERMINATED, 0, "Kikoo"))
+                }
+            }
+        }.also { session ->
+            sipHandler.onOutgoingCallConnected = { _: Object, _: Map<String, String> ->
+                Rlog.d(TAG, "Outgoing call connected")
+                session.mState = ImsCallSessionImplBase.State.ESTABLISHED
+                val callProfile = ImsCallProfile(ImsCallProfile.SERVICE_TYPE_NORMAL, ImsCallProfile.CALL_TYPE_VOICE,
+                    Bundle(),
+                    ImsStreamMediaProfile(
+                        ImsStreamMediaProfile.AUDIO_QUALITY_AMR_WB,
+                        ImsStreamMediaProfile.DIRECTION_SEND_RECEIVE,
+                        ImsStreamMediaProfile.VIDEO_QUALITY_NONE,
+                        ImsStreamMediaProfile.DIRECTION_INACTIVE,
+                        ImsStreamMediaProfile.RTT_MODE_DISABLED,
+                    ))
+                session.mListener.callSessionInitiated(callProfile)
             }
         }
     }
@@ -219,8 +239,11 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
                 }
 
                 override fun terminate(reason: Int) {
-                    sipHandler.terminateCall()
                     Rlog.d(TAG, "Terminating call")
+                    sipHandler.myHandler.post {
+                        sipHandler.terminateCall()
+                        callListener?.callSessionTerminated(ImsReasonInfo(ImsReasonInfo.CODE_USER_TERMINATED, 0, "Kikoo"))
+                    }
                 }
 
             }, Bundle())
