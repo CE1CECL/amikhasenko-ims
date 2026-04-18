@@ -128,7 +128,7 @@ class PhhMmTelFeature(val slotId: Int) : PhhMmTelFeatureProtected(slotId) {
                 val callProfile = ImsCallProfile(ImsCallProfile.SERVICE_TYPE_NORMAL, ImsCallProfile.CALL_TYPE_VOICE,
                     Bundle(),
                     ImsStreamMediaProfile(
-                        ImsStreamMediaProfile.AUDIO_QUALITY_AMR_WB,
+                        ImsStreamMediaProfile.AUDIO_QUALITY_AMR,
                         ImsStreamMediaProfile.DIRECTION_SEND_RECEIVE,
                         ImsStreamMediaProfile.VIDEO_QUALITY_NONE,
                         ImsStreamMediaProfile.DIRECTION_INACTIVE,

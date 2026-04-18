@@ -19,7 +19,6 @@ import android.telephony.TelephonyManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import me.phh.ims.Rnnoise
 import java.io.*
 import java.net.*
 import java.util.concurrent.Executor
@@ -797,6 +796,11 @@ a=sendrecv
     }
 
     fun handleCancel(request: SipRequest): Int {
+        // RFC 3261 §9.2: CANCEL has no effect if we already sent a final response (200 OK)
+        if (callStarted.get()) {
+            Rlog.d(TAG, "CANCEL received after 200 OK — ignoring per RFC 3261 §9.2")
+            return 200
+        }
         callStopped.set(true)
         Rlog.d(TAG, "Cancelled call ${request.headers["call-id"]!![0]}")
 
@@ -828,14 +832,17 @@ a=sendrecv
         thread {
             var sequenceNumber = 0
 
+            Rlog.d(TAG, "Encode thread started: amrTrack=${call.amrTrack} remote=${call.rtpRemoteAddr}:${call.rtpRemotePort} gen=$gen")
             val encoder = MediaCodec.createEncoderByType("audio/3gpp")
             val mediaFormat = MediaFormat.createAudioFormat("audio/3gpp", 8000, 1)
             mediaFormat.setInteger(MediaFormat.KEY_BIT_RATE, 12200)
+            mediaFormat.setInteger(MediaFormat.KEY_PRIORITY, 0) //  0 = realtime priority, encoder will not fall behind
             encoder.configure(mediaFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             encoder.start()
 
             while(!callStarted.get()) {
                 if (callStopped.get() || callGeneration.get() != gen) {
+                    Rlog.d(TAG, "Silence loop exiting early: callStopped=${callStopped.get()}, genMismatch=${callGeneration.get() != gen}")
                     encoder.stop()
                     encoder.release()
                     return@thread
@@ -859,31 +866,49 @@ a=sendrecv
                 call.rtpSocket.send(dgramPacket)
                 sequenceNumber++
             }
-
-            val rnnNoise = Rnnoise()
+            Rlog.d(TAG, "Silence loop exited after $sequenceNumber packets, starting real encoding")
 
             // DANGER: Don't open the mic before the user acknowledged opening the call!
 
             val minBufferSize = AudioRecord.getMinBufferSize(8000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
             val audioRecord = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, 8000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBufferSize)
+            Rlog.d(TAG, "AudioRecord created with minBufferSize=$minBufferSize, state=${audioRecord.state}")
 
+            // Pin capture to the built-in mic so the Samsung HAL cannot reroute it to
+            // the baseband PCM path (pcmC0D110c) that produces silence for software IMS.
+            // setPreferredDevice overrides HAL source-based routing while keeping
+            // VOICE_COMMUNICATION semantics (call-mode output path stays correct).
+            val audioManager = ctxt.getSystemService(android.media.AudioManager::class.java)
+            val builtinMic = audioManager.getDevices(android.media.AudioManager.GET_DEVICES_INPUTS)
+                .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
+            if (builtinMic != null) {
+                audioRecord.preferredDevice = builtinMic
+                Rlog.d(TAG, "AudioRecord preferredDevice set to builtin mic: id=${builtinMic.id} name=${builtinMic.productName}")
+            } else {
+                Rlog.w(TAG, "AudioRecord: no TYPE_BUILTIN_MIC found, proceeding without preferredDevice")
+            }
+
+            val prevAudioMode = audioManager.mode
+            audioManager.mode = android.media.AudioManager.MODE_IN_COMMUNICATION
             audioRecord.startRecording()
+            Rlog.d(TAG, "AudioRecord started, state=${audioRecord.recordingState} audioMode=${audioManager.mode} (was $prevAudioMode) preferredDevice=${audioRecord.preferredDevice?.type}")
 
             var firstPacket = true
+            var realFrameCount = 0
 
-            val bufferSize = ((minBufferSize + (rnnNoise.getFrameSize() - 1 )) / rnnNoise.getFrameSize()).toInt() * rnnNoise.getFrameSize()
-            val buffer = ByteArray(bufferSize)
-            val bufferPostRnnoise = ByteArray(bufferSize)
+            val buffer = ByteArray(minBufferSize)
             while (true) {
                 if (callStopped.get() || callGeneration.get() != gen) break
-                val nRead = audioRecord.read(buffer,0, buffer.size)
-                // Convert buffer from ByteArray to ShortArray
-                rnnNoise.processFrame(buffer, bufferPostRnnoise)
+                val nRead = audioRecord.read(buffer, 0, buffer.size)
+                if (realFrameCount < 5) {
+                    val allZero = buffer.take(nRead.coerceAtLeast(0)).all { it == 0.toByte() }
+                    Rlog.d(TAG, "AudioRecord.read nRead=$nRead allZero=$allZero (bufferSize=${buffer.size})")
+                }
 
                 val inBufIdx = encoder.dequeueInputBuffer(-1)
                 val inBuf = encoder.getInputBuffer(inBufIdx)!!
                 inBuf.clear()
-                inBuf.put(bufferPostRnnoise, 0, nRead)
+                inBuf.put(buffer, 0, nRead)
 
                 // Fake timestamp but it is not appearing in the output stream anyway
                 encoder.queueInputBuffer(inBufIdx, 0, nRead, System.nanoTime() / 1000, 0)
@@ -895,11 +920,19 @@ a=sendrecv
                 // queue fills up and dequeueInputBuffer(-1) deadlocks.
                 val outBufInfo = MediaCodec.BufferInfo()
                 var drainTimeout = -1L
+                var outCount = 0
                 while (true) {
                     val outBufIdx = encoder.dequeueOutputBuffer(outBufInfo, drainTimeout)
                     drainTimeout = 0L
-                    if (outBufIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) continue
-                    if (outBufIdx < 0) break
+                    if (outBufIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        Rlog.d(TAG, "Encoder output format changed")
+                        continue
+                    }
+                    if (outBufIdx < 0) {
+                        if (outCount > 0) Rlog.d(TAG, "Drained $outCount output buffers")
+                        break
+                    }
+                    outCount++
 
                     val outBuf = encoder.getOutputBuffer(outBufIdx)!!
 
@@ -907,60 +940,91 @@ a=sendrecv
                     outBuf.get(encoderData)
                     encoder.releaseOutputBuffer(outBufIdx, false)
 
-                    var bufPos = 0
-                    while(bufPos < outBufInfo.size) {
-                        val frameSize = 32 // Read from encoderData[0]
+                    if (realFrameCount == 0) {
+                        Rlog.d(TAG, "First encoder output: size=${outBufInfo.size} raw=${encoderData.take(32).joinToString(" ") { "%02x".format(it) }}")
+                    }
 
-                        // Every 20ms, at 8kHz, we have 160 samples
+                    var bufPos = 0
+                    while (bufPos < outBufInfo.size) {
+                        val frameSize = 32
+                        if (outBufInfo.size - bufPos < frameSize) break
+
+                        // Encoder outputs octet-aligned AMR-NB frames (RFC 4867 §5):
+                        //   byte 0 = frame header: [0][FT[3:0]][Q][PP]
+                        //   bytes 1-31 = 244 payload bits, MSB-first, 4 bits zero-padding at end
+                        val ft = (encoderData[bufPos].toUByte().toInt() shr 3) and 0xf
+                        val q  = (encoderData[bufPos].toUByte().toInt() shr 2) and 0x1
+
+                        // Build RFC 4867 §4.4 bandwidth-efficient single-frame payload (32 bytes):
+                        //   [CMR(4)][F(1)][FT(4)][Q(1)][payload_bits(244)][pad(2)]
+                        // CMR=15 (0xF) = no codec-mode request; F=0 = last (only) frame.
+                        val cmr = 0xf
+                        val f   = 0
+                        // Byte 0: CMR[3:0] | F | FT[3:1]
+                        val beByte0 = (cmr shl 4) or (f shl 3) or (ft shr 1)
+                        // Byte 1: FT[0] | Q | payload[0:5]  (upper 6 bits of encoder byte 1)
+                        val beByte1 = ((ft and 1) shl 7) or (q shl 6) or
+                                      (encoderData[bufPos + 1].toUByte().toInt() shr 2)
+                        // Bytes 2-31: slide a 2-bit window across encoder bytes 1-31
+                        val beRest = (1 until frameSize - 1).map { i ->
+                            val lo = (encoderData[bufPos + i].toUByte().toInt() and 0x3) shl 6
+                            val hi = (encoderData[bufPos + i + 1].toUByte().toInt() shr 2) and 0x3f
+                            lo or hi
+                        }
+
+                        // Every 20 ms, at 8 kHz, we have 160 samples
                         val timestamp = sequenceNumber * 160
-                        val rtpHeader = listOf(
-                            // RTP
-                            0x80, //rtp version
-                            ( if(firstPacket) 0x80 else 0 ) or call.amrTrack, //payload type
-                            (sequenceNumber shr 8), (sequenceNumber and 0xff),
-                            (timestamp shr 24), ((timestamp shr 16) and 0xff), ((timestamp shr 8) and 0xff), (timestamp and 0xff),
-                            0x03, 0x00, 0xd2, 0x00, //SSRC
+                        val rtpHeader = byteArrayOf(
+                            0x80.toByte(),
+                            ((if (firstPacket) 0x80 else 0) or call.amrTrack).toByte(),
+                            (sequenceNumber shr 8).toByte(), (sequenceNumber and 0xff).toByte(),
+                            (timestamp shr 24).toByte(), ((timestamp shr 16) and 0xff).toByte(),
+                            ((timestamp shr 8) and 0xff).toByte(), (timestamp and 0xff).toByte(),
+                            0x03, 0x00, 0xd2.toByte(), 0x00
                         )
                         firstPacket = false
 
-                        val ft = (encoderData[bufPos + 0].toUInt().toInt() shr 3) and 0xf
-                        val cmr = 7 // we want to announce we want the 12.2kbps profile
-                        val f = 0
-                        val q = 1
-                        val firstByte = (cmr shl 4) or (f shl 3) or (ft shr 1)
-                        val secondByte = ( (ft and 1) shl 7) or (q shl 6) or (encoderData[bufPos + 1].toUInt().toInt() shr 2)
+                        val buf = rtpHeader +
+                            byteArrayOf(beByte0.toByte(), beByte1.toByte()) +
+                            beRest.map { it.toByte() }.toByteArray()
 
-                        val nextBytes = (1 until (frameSize - 1)).map { i ->
-                            // Take 2 bits left, 6 bits right
-                            val left = (encoderData[bufPos + i].toUByte().toUInt().toInt() and 0x3) shl 6
-                            val right = (encoderData[bufPos + i + 1].toUByte().toUInt().toInt() shr 2) and 0x3f
-                            left or right
+                        val dgramPacket = DatagramPacket(buf, buf.size, call.rtpRemoteAddr, call.rtpRemotePort)
+                        try {
+                            call.rtpSocket.send(dgramPacket)
+                            if (realFrameCount < 10) {
+                                Rlog.d(TAG, "Sent RTP packet #$sequenceNumber ft=$ft ts=$timestamp payload=${buf.drop(12).take(4).joinToString(" ") { "%02x".format(it) }}... to ${call.rtpRemoteAddr}:${call.rtpRemotePort}")
+                            }
+                            if (realFrameCount == 0) {
+                                Rlog.d(TAG, "First RTP packet full hex: ${buf.joinToString(" ") { "%02x".format(it) }}")
+                            }
+                            if (sequenceNumber % 50 == 0 && realFrameCount >= 10) {
+                                Rlog.d(TAG, "Sent RTP packet #$sequenceNumber ft=$ft ts=$timestamp to ${call.rtpRemoteAddr}:${call.rtpRemotePort}")
+                            }
+                        } catch (e: Exception) {
+                            Rlog.e(TAG, "Failed to send RTP packet #$sequenceNumber: ${e.message}", e)
                         }
-                        // Need to know the size in **bits** to know whether we include the lastByte or not
-                        // Anyway in mode = 7 = 12.2KHz, we don't.
-                        //val lastByte = (encoderData[bufPos + frameSize - 1].toUByte().toUInt().toInt() and 0x3) shl 6
-
-                        val buf = (rtpHeader + firstByte + secondByte + nextBytes /*+ lastByte*/).map { it.toUByte() }.toUByteArray().toByteArray()
-
-                        val dgramPacket =
-                            DatagramPacket(buf, buf.size, call.rtpRemoteAddr, call.rtpRemotePort)
-                        call.rtpSocket.send(dgramPacket)
 
                         sequenceNumber++
+                        realFrameCount++
                         bufPos += frameSize
                     }
                 }
             }
+            Rlog.d(TAG, "Encode thread exiting: callStopped=${callStopped.get()}, genMismatch=${callGeneration.get() != gen}, totalPacketsSent=$sequenceNumber")
             audioRecord.stop()
             audioRecord.release()
             encoder.stop()
             encoder.release()
+            audioManager.mode = prevAudioMode
         }
     }
 
     var currentCall: Call? = null
     fun acceptCall() {
         thread {
+            // Wait for any outstanding PRACK acknowledgements before sending 200 OK (RFC 3262 §5)
+            val pendingSeqs = synchronized(prAckWaitLock) { prAckWait.toSet() }
+            pendingSeqs.forEach { waitPrack(it) }
 
             val local =
                 if(socket.gLocalAddr() is Inet6Address)
@@ -1061,27 +1125,61 @@ a=sendrecv
     }
 
     /*
-    Note: local/remote none/sendrecv are the precondition extension status.
-    They basically mean that local/remote are pre-allocating resources before fulfilling the call
+    Note: local/remote none/sendrecv are the precondition QoS status (RFC 3312).
+    They signal that each side is pre-allocating media resources before the call is established.
+    "none" = not yet ready, "sendrecv" = ready to send and receive.
 
-    Outgoing call process:
-    (Note: If not specified, Requests are local => remote, response are remote => local)
-    1. INVITE with SDP containing none current status, and all tracks we can support
-    2. (useless) 100 Trying
-    3. 183 Session Progress with SDP containing none current status, but selected one track and Rseq
-    4. PRACK 183's RSeq and wait for its 200 OK PRACK
-    5. UPDATE with SDP containing local sendrecv and remote none (We're starting decoding/encoding, but don't open mic)
-    6. 200 OK UPDATE with SDP containing local sendrecv and remote sendrecv (precondition fullfilled)
-    7. 183 Session Progress on the INVITE (no SDP, no PRACK)
-    8. UPDATE from remote to local with final SDP (precondition infos can be absent)
-    9. 200 OK UPDATE from local to remote with our final SDP
-    10. 180 Ringing on INVITE (meaning it's actually ringing on the other side)
-    11. 200 OK on INVITE (meaning the call is accepted) (opening mic)
-    12. ACK (no answer?)
+    Outgoing call process — all messages are local→remote unless noted otherwise.
+    This callback (setResponseCallback on the INVITE call-id) handles responses to our
+    INVITE and to in-dialog requests we send (PRACK, UPDATE).  Incoming requests from the
+    remote (e.g. the remote's UPDATE in step 8) are handled separately in parseMessage.
 
-    Call is now running
-    During call, remote will regularly send 200 OK on INVITE to keep alive (we have the timer extension enabled)
-    We probably need to keep sending UPDATE-s regularly to keep alive
+    1. Send INVITE with SDP:
+         a=curr:qos local none   (we haven't allocated media yet)
+         a=curr:qos remote none  (remote hasn't either)
+         a=des:qos optional local/remote sendrecv
+         Lists all tracks we support (AMR, DTMF).
+
+    2. Receive 100 Trying — ignored (no SDP → return false).
+
+    3. Receive 183 Session Progress with remote SDP (track selected) and RSeq header.
+       → Send PRACK for that RSeq, save 183 as respInFlight, return false (suspend processing).
+
+    4. Receive 200 OK PRACK — resume processing the saved 183 (rseqHandled=true).
+       Two sub-paths depending on whether the 183 carried Require: precondition:
+
+       Path A — precondition present, local=none:
+         → Start callDecodeThread + callEncodeThread (encoder sends silence, mic not open yet).
+         → Send UPDATE claiming local=sendrecv (we have allocated our media resources).
+
+       Path B — no precondition (or precondition already satisfied):
+         → Start callDecodeThread + callEncodeThread immediately.
+         → No UPDATE sent; proceed to wait for 180/200.
+
+    5. [Path A] Receive 200 OK UPDATE — remote now reports sendrecv on both sides.
+       Nothing to do in code; currentCall SDP was already updated when 200 arrived.
+
+    6. [Path A] Receive another 183 Session Progress (no SDP, no new RSeq — no PRACK needed).
+       → !isSdp → return false.
+
+    7. [Handled in parseMessage, not here] Remote sends UPDATE with its final SDP.
+       We respond 200 OK with our SDP.
+
+    8. Receive 180 Ringing — no SDP → return false (just informs UI via onOutgoingCallConnected
+       which is only fired on 200 OK, not here).
+
+    9. Receive 200 OK on INVITE — call is accepted:
+       → Send ACK (ACK to 2xx goes to Contact URI, routed via Record-Route; no response to ACK).
+       → callStarted.set(true): encode thread exits silence loop, AudioRecord opens (mic live).
+       → onOutgoingCallConnected invoked.
+
+    Call is now running.
+
+    Session timers (RFC 4028): we advertise Session-Expires: 900 / Supported: timer.
+    The network nominates a refresher; if it nominates us (UAC), we must send a re-INVITE
+    before the session expires. If it nominates itself (UAS), it sends re-INVITEs to us and
+    we respond 200 OK (handled in parseMessage as an incoming INVITE).
+    NOTE: periodic re-INVITE sending is not yet implemented for the UAC-refresher case.
      */
 
     var respInFlight: SipResponse? = null
@@ -1095,6 +1193,7 @@ a=sendrecv
             val rtpSocket = DatagramSocket(0, localAddr)
             network.bindSocket(rtpSocket)
             //rtpSocket.connect(rtpRemoteAddr, rtpRemotePort.toInt())
+            Rlog.d(TAG, "RTP socket created for outgoing call: local=${rtpSocket.localAddress}:${rtpSocket.localPort}")
 
             val amrTrack = 97
             val amrTrackDesc = "fmtp:97 mode-change-capability=2;octet-align=0;max-red=0"
@@ -1185,7 +1284,6 @@ a=sendrecv
                 if (cseq.contains("ACK")) return@setResponseCallback  false
 
                 if (cseq.contains("INVITE") && (resp.statusCode == 200 || resp.statusCode == 202)) {
-                    // TODO Send UI that call started
                     // ACK C-Seq must be the same as INVITE C-Seq
                     // Extract C-Seq
                     val cseqLine = resp.headers["cseq"]!![0]
@@ -1345,18 +1443,21 @@ a=sendrecv
             decoder.configure(mediaFormat, null, null, 0)
             decoder.start()
 
+            var receivedCount = 0
             while(true) {
                 if (callStopped.get() || callGeneration.get() != gen) break
                 val dgramBuf = ByteArray(2048)
                 val dgram = DatagramPacket(dgramBuf, dgramBuf.size)
                 currentCall!!.rtpSocket.receive(dgram)
+                receivedCount++
 
                 // Check RTP payload type
                 val pt = dgramBuf[1].toUByte().toInt() and 0x7f
-                Rlog.d(TAG, "Received RTP data is length ${dgram.length} pt is $pt")
-
                 val ft = (dgramBuf[13].toUByte().toUInt() shr 7) or ((dgramBuf[12].toUByte().toUInt() and (7).toUInt()) shl 1)
-                Rlog.d(TAG, "Received RTP data (expecting AMR) ft is $ft")
+
+                if (receivedCount % 50 == 0) {
+                    Rlog.d(TAG, "Received RTP packet #$receivedCount: length=${dgram.length} pt=$pt ft=$ft")
+                }
 
                 if(ft.toInt() != 7) continue
 
@@ -1494,6 +1595,8 @@ a=sendrecv
         }
 
         val hasEarlyMedia = request.headers["p-early-media"]?.isNotEmpty() == true
+        val callerSupportsPrecondition = (request.headers["supported"].orEmpty() +
+                request.headers["require"].orEmpty()).any { it.contains("precondition") }
 
         // Look for an AMR/8000 mode
         // TODO: Select which one? SFR has two, one with mode-set=7 one without it. This would require reading the fmtp lines
@@ -1513,6 +1616,7 @@ a=sendrecv
             val rtpSocket = DatagramSocket(0, localAddr)
             network.bindSocket(rtpSocket)
             rtpSocket.connect(rtpRemoteAddr, rtpRemotePort.toInt())
+            Rlog.d(TAG, "RTP socket created: local=${rtpSocket.localAddress}:${rtpSocket.localPort}, remote=${rtpSocket.inetAddress}:${rtpSocket.port}")
 
             val local =
                 if(socket.gLocalAddr() is Inet6Address)
@@ -1543,24 +1647,32 @@ a=maxptime:240
 a=$dtmfTrackDesc
 a=fmtp:$amrTrack mode-set=7;octet-align=0;max-red=0
 a=fmtp:$dtmfTrack 0-15
+${if (callerSupportsPrecondition) """
 a=curr:qos local none
 a=curr:qos remote none
 a=des:qos mandatory local sendrecv
 a=des:qos mandatory remote sendrecv
-a=conf:qos remote sendrecv
+a=conf:qos remote sendrecv""".trimIndent() else ""}
 a=sendrecv
                        """.trim()).toByteArray()
+
+            // Generate a single local tag for all responses in this dialog (RFC 3261 §12.1.1)
+            val localToTag = randomBytes(6).toHex()
+            val toWithTag = request.headers["to"]!!.map { h ->
+                if (h.contains(";tag=")) h else "$h;tag=$localToTag"
+            }
 
             val myHeaders = commonHeaders + //Require: precondition
                 """
                         Contact: $contactTel
                         Allow: INVITE, ACK, CANCEL, BYE, UPDATE, REFER, NOTIFY, INFO, MESSAGE, PRACK, OPTIONS
                         Content-Type: application/sdp
-                        Require: 100rel, precondition
+                        Require: 100rel${if (callerSupportsPrecondition) ", precondition" else ""}
                         RSeq: $mySeqCounter
                         P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=20810b8c49752501
                         """.toSipHeadersMap() +
-                            request.headers.filter { (k, _) -> k in listOf("cseq", "via", "from", "to", "call-id") } -
+                            request.headers.filter { (k, _) -> k in listOf("cseq", "via", "from", "to", "call-id") } +
+                            mapOf("to" to toWithTag) -
                 "route" - "security-verify"
 
             currentCall = Call(

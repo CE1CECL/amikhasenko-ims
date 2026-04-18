@@ -127,7 +127,84 @@ vendor.ril.ims.                u:object_r:vendor_ims_prop:s0
 allow sehradiomanager vendor_ims_prop:property_service set;
 ```
 
-## Building with Gradle (development only)
+## Required binary patches
+
+The Samsung audio HAL (`libaudioproxy.so`) contains a range-gate in
+`proxy_open_capture_stream` that skips arming the ALSA mic mixer path unless an
+internal `proxy_mode` value is in `[17..23]`. For software IMS calls the value is
+always outside that range, so the microphone ADC stays silent.
+
+The fix is a 2-byte NOP patch at file offset `0x9a46` (vaddr `0xaa46`) that makes
+the mixer arming unconditional. Full reverse-engineering notes and the proxy_mode
+map are in [RE/README.md](RE/README.md).
+
+### Step 1 — Pull the binary from the device
+
+```sh
+cd RE/
+bash scripts/pull_binaries.sh   # requires: adb root
+```
+
+This places `libaudioproxy.so` in `RE/binaries/`.
+
+### Step 2 — Verify and apply the patch
+
+```sh
+# Dry-run: confirms the expected bytes are present
+python3 RE/scripts/patch_libaudioproxy.py
+
+# Apply: writes RE/binaries/libaudioproxy_patched.so (original backed up as .so.orig)
+python3 RE/scripts/patch_libaudioproxy.py --apply
+```
+
+### Step 3 — Push to device
+
+Requires an unlocked bootloader and a userdebug build (so `adb root` and `adb remount` work):
+
+```sh
+adb root
+adb remount
+adb push RE/binaries/libaudioproxy_patched.so /vendor/lib/libaudioproxy.so
+adb shell restorecon /vendor/lib/libaudioproxy.so
+adb reboot
+```
+
+## Required framework patches
+
+### `packages/services/Telecomm` — use `MODE_IN_COMMUNICATION` instead of `MODE_IN_CALL`
+
+The Samsung audio HAL treats `MODE_IN_CALL` specially: it reconfigures any active primary
+capture stream to the baseband uplink PCM path (`/dev/snd/pcmC0D110c`), which taps the
+hardware circuit-switched voice path and produces silence for software IMS stacks that do
+their own RTP encoding.  Switching to `MODE_IN_COMMUNICATION` keeps the microphone on the
+real ADC path.
+
+```diff
+--- a/src/com/android/server/telecom/CallAudioModeStateMachine.java
++++ b/src/com/android/server/telecom/CallAudioModeStateMachine.java
+@@ -523,10 +523,17 @@ public class CallAudioModeStateMachine extends StateMachine {
+             Log.i(this, "enter: AudioManager#requestAudioFocus(CALL)");
+             mAudioManager.requestAudioFocusForCall(AudioManager.STREAM_VOICE_CALL,
+                 AudioManager.AUDIOFOCUS_GAIN_TRANSIENT);
+-            Log.i(this, "enter: AudioManager#setMode(MODE_IN_CALL)");
+-            mAudioManager.setMode(AudioManager.MODE_IN_CALL);
+-            mLocalLog.log("Mode MODE_IN_CALL");
+-            mMostRecentMode = AudioManager.MODE_IN_CALL;
++            // Use MODE_IN_COMMUNICATION instead of MODE_IN_CALL so that the Samsung audio HAL
++            // does not route AudioRecord capture to the baseband uplink PCM path.  When in
++            // MODE_IN_CALL the HAL reconfigures any primary capture stream to callrecord_uplink
++            // (/dev/snd/pcmC0D110c), which taps the hardware CP voice path and produces silence
++            // for software IMS stacks that do their own RTP encoding.  MODE_IN_COMMUNICATION
++            // keeps the capture on the real microphone ADC path.
++            Log.i(this, "enter: AudioManager#setMode(MODE_IN_COMMUNICATION)");
++            mAudioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
++            mLocalLog.log("Mode MODE_IN_COMMUNICATION");
++            mMostRecentMode = AudioManager.MODE_IN_COMMUNICATION;
+             mCallAudioManager.setCallAudioRouteFocusState(CallAudioRouteController.ACTIVE_FOCUS);
+         }
+```
+
+## Building with Gradle
 
 The public `android.jar` (API 33) stubs do not expose the internal IMS APIs. To build
 with Gradle you need a full `android.jar` built from AOSP sources in `app/libs/android.jar`,
